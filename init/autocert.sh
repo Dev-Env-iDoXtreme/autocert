@@ -91,12 +91,7 @@ step ca init \
 echo
 echo -e "\e[1mCreating autocert provisioner...\e[0m"
 
-expect <<EOD
-spawn step ca provisioner add autocert --create
-expect "Please enter a password to encrypt the provisioner private key? \\\\\\[leave empty and we'll generate one\\\\\\]: "
-send "${AUTOCERT_PASSWORD}\n"
-expect eof
-EOD
+step ca provisioner add autocert --create --password-file <(echo "${AUTOCERT_PASSWORD}")
 
 echo
 echo -e "\e[1mCreating step namespace and preparing environment...\e[0m"
@@ -129,13 +124,15 @@ kubectl -n step rollout status deployment/autocert
 CA_BUNDLE=$(cat $(step path)/certs/root_ca.crt | base64 | tr -d '\n')
 
 cat <<EOF | kubectl apply -f -
-apiVersion: admissionregistration.k8s.io/v1beta1
+apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
   name: autocert-webhook-config
   labels: {app: autocert}
 webhooks:
   - name: autocert.step.sm
+    sideEffects: None
+    admissionReviewVersions: ["v1beta1"]
     clientConfig:
       service:
         name: autocert

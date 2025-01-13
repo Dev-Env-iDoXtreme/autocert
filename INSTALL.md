@@ -26,12 +26,12 @@ kubectl run autocert-init -it --rm --image smallstep/autocert-init --restart Nev
 
 ## Manual install
 
-To install manually you'll need to [install step](https://github.com/smallstep/cli#installing) version `0.8.3` or later.
+To install manually you'll need to [install step](https://github.com/smallstep/cli#installing) version `0.18.2` or later.
 
 ```
 $ step version
-Smallstep CLI/0.8.3 (darwin/amd64)
-Release Date: 2019-01-16 01:46 UTC
+Smallstep CLI/0.18.2 (darwin/amd64)
+Release Date: 2022-03-30 06:08 UTC
 ```
 
 ### Create a CA
@@ -63,7 +63,7 @@ Add provisioning credentials for use by `autocert`. You'll be prompted for a pas
 $ step ca provisioner add autocert --create
 ```
 
-For older versions of `step`:
+For older versions of [`step`](https://github.com/smallstep/cli/releases):
 
 * Run `step ca init` and follow prompts
 * Edit `$(step path)/config/ca.json` and change base paths to `/home/step`

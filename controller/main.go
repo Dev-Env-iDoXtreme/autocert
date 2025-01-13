@@ -1,29 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
-	"github.com/ghodss/yaml"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/pki"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/utils"
+	"github.com/smallstep/cli-utils/errs"
+	"github.com/smallstep/cli-utils/step"
+	"go.step.sm/crypto/pemutil"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -39,10 +43,13 @@ const (
 	firstAnnotationKey            = "autocert.step.sm/init-first"
 	bootstrapperOnlyAnnotationKey = "autocert.step.sm/bootstrapper-only"
 	sansAnnotationKey             = "autocert.step.sm/sans"
+	ownerAnnotationKey            = "autocert.step.sm/owner"
+	modeAnnotationKey             = "autocert.step.sm/mode"
 	volumeMountPath               = "/var/run/autocert.step.sm"
 	tokenSecretKey                = "token"
-	tokenSecretLabel              = "autocert.step.sm/token"
-	tokenLifetime                 = 5 * time.Minute
+	//nolint:gosec // not a secret
+	tokenSecretLabel = "autocert.step.sm/token"
+	tokenLifetime    = 5 * time.Minute
 )
 
 // Config options for the autocert admission controller.
@@ -123,13 +130,13 @@ type PatchOperation struct {
 func escapeJSONPath(path string) string {
 	// Replace`~` with `~0` then `/` with `~1`. Note that the order
 	// matters otherwise we'll turn a `/` into a `~/`.
-	path = strings.Replace(path, "~", "~0", -1)
-	path = strings.Replace(path, "/", "~1", -1)
+	path = strings.ReplaceAll(path, "~", "~0")
+	path = strings.ReplaceAll(path, "/", "~1")
 	return path
 }
 
 func loadConfig(file string) (*Config, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +152,7 @@ func loadConfig(file string) (*Config, error) {
 // createTokenSecret generates a kubernetes Secret object containing a bootstrap token
 // in the specified namespace. The secret name is randomly generated with a given prefix.
 // A goroutine is scheduled to cleanup the secret after the token expires. The secret
-// is also labelled for easy identification and manual cleanup.
+// is also labeled for easy identification and manual cleanup.
 func createTokenSecret(prefix, namespace, token string) (string, error) {
 	secret := corev1.Secret{
 		TypeMeta: metav1.TypeMeta{
@@ -186,11 +193,12 @@ func createTokenSecret(prefix, namespace, token string) (string, error) {
 		log.Errorf("Secret creation error. Response: %v", resp)
 		return "", errors.Wrap(err, "secret creation")
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Errorf("Secret creation error (!2XX). Response: %v", resp)
 		var rbody []byte
 		if resp.Body != nil {
-			if data, err := ioutil.ReadAll(resp.Body); err == nil {
+			if data, err := io.ReadAll(resp.Body); err == nil {
 				rbody = data
 			}
 		}
@@ -200,7 +208,7 @@ func createTokenSecret(prefix, namespace, token string) (string, error) {
 
 	var rbody []byte
 	if resp.Body != nil {
-		if data, err := ioutil.ReadAll(resp.Body); err == nil {
+		if data, err := io.ReadAll(resp.Body); err == nil {
 			rbody = data
 		}
 	}
@@ -215,7 +223,7 @@ func createTokenSecret(prefix, namespace, token string) (string, error) {
 
 	// Clean up after ourselves by deleting the Secret after the bootstrap
 	// token expires. This is best effort -- obviously we'll miss some stuff
-	// if this process goes away -- but the secrets are also labelled so
+	// if this process goes away -- but the secrets are also labeled so
 	// it's also easy to clean them up in bulk using kubectl if we miss any.
 	go func() {
 		time.Sleep(tokenLifetime)
@@ -233,6 +241,7 @@ func createTokenSecret(prefix, namespace, token string) (string, error) {
 			ctxLog.WithField("error", err).Error("Error deleting expired bootstrap token secret")
 			return
 		}
+		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			ctxLog.WithFields(log.Fields{
 				"status":     resp.Status,
@@ -249,7 +258,7 @@ func createTokenSecret(prefix, namespace, token string) (string, error) {
 // mkBootstrapper generates a bootstrap container based on the template defined in Config. It
 // generates a new bootstrap token and mounts it, along with other required configuration, as
 // environment variables in the returned bootstrap container.
-func mkBootstrapper(config *Config, podName, commonName, duration, namespace string, sans []string, provisioner *ca.Provisioner) (corev1.Container, error) {
+func mkBootstrapper(config *Config, podName, commonName, duration, owner, mode, namespace string, sans []string, provisioner *ca.Provisioner) (corev1.Container, error) {
 	b := config.Bootstrapper
 
 	token, err := provisioner.Token(commonName, sans...)
@@ -271,50 +280,59 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 	}
 	log.Infof("Secret name is: %s", secretName)
 
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "COMMON_NAME",
-		Value: commonName,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "DURATION",
-		Value: duration,
-	})
-
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name: "STEP_TOKEN",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: secretName,
+	b.Env = append(b.Env,
+		corev1.EnvVar{
+			Name:  "COMMON_NAME",
+			Value: commonName,
+		},
+		corev1.EnvVar{
+			Name:  "DURATION",
+			Value: duration,
+		},
+		corev1.EnvVar{
+			Name:  "OWNER",
+			Value: owner,
+		},
+		corev1.EnvVar{
+			Name:  "MODE",
+			Value: mode,
+		},
+		corev1.EnvVar{
+			Name: "STEP_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secretName,
+					},
+					Key:      tokenSecretKey,
+					Optional: ptr.To[bool](true),
 				},
-				Key: tokenSecretKey,
 			},
 		},
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "STEP_CA_URL",
-		Value: config.CaURL,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "STEP_FINGERPRINT",
-		Value: fingerprint,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "STEP_NOT_AFTER",
-		Value: config.CertLifetime,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "POD_NAME",
-		Value: podName,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "NAMESPACE",
-		Value: namespace,
-	})
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name:  "CLUSTER_DOMAIN",
-		Value: config.ClusterDomain,
-	})
+		corev1.EnvVar{
+			Name:  "STEP_CA_URL",
+			Value: config.CaURL,
+		},
+		corev1.EnvVar{
+			Name:  "STEP_FINGERPRINT",
+			Value: fingerprint,
+		},
+		corev1.EnvVar{
+			Name:  "STEP_NOT_AFTER",
+			Value: config.CertLifetime,
+		},
+		corev1.EnvVar{
+			Name:  "POD_NAME",
+			Value: podName,
+		},
+		corev1.EnvVar{
+			Name:  "NAMESPACE",
+			Value: namespace,
+		},
+		corev1.EnvVar{
+			Name:  "CLUSTER_DOMAIN",
+			Value: config.ClusterDomain,
+		})
 
 	return b, nil
 }
@@ -322,26 +340,27 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 // mkRenewer generates a new renewer based on the template provided in Config.
 func mkRenewer(config *Config, podName, commonName, namespace string) corev1.Container {
 	r := config.Renewer
-	r.Env = append(r.Env, corev1.EnvVar{
-		Name:  "STEP_CA_URL",
-		Value: config.CaURL,
-	})
-	r.Env = append(r.Env, corev1.EnvVar{
-		Name:  "COMMON_NAME",
-		Value: commonName,
-	})
-	r.Env = append(r.Env, corev1.EnvVar{
-		Name:  "POD_NAME",
-		Value: podName,
-	})
-	r.Env = append(r.Env, corev1.EnvVar{
-		Name:  "NAMESPACE",
-		Value: namespace,
-	})
-	r.Env = append(r.Env, corev1.EnvVar{
-		Name:  "CLUSTER_DOMAIN",
-		Value: config.ClusterDomain,
-	})
+	r.Env = append(r.Env,
+		corev1.EnvVar{
+			Name:  "STEP_CA_URL",
+			Value: config.CaURL,
+		},
+		corev1.EnvVar{
+			Name:  "COMMON_NAME",
+			Value: commonName,
+		},
+		corev1.EnvVar{
+			Name:  "POD_NAME",
+			Value: podName,
+		},
+		corev1.EnvVar{
+			Name:  "NAMESPACE",
+			Value: namespace,
+		},
+		corev1.EnvVar{
+			Name:  "CLUSTER_DOMAIN",
+			Value: config.ClusterDomain,
+		})
 	return r
 }
 
@@ -352,18 +371,18 @@ func removeInitContainers() (ops PatchOperation) {
 	}
 }
 
-func addContainers(existing, new []corev1.Container, path string) (ops []PatchOperation) {
+func addContainers(existing, nu []corev1.Container, path string) (ops []PatchOperation) {
 	if len(existing) == 0 {
 		return []PatchOperation{
 			{
 				Op:    "add",
 				Path:  path,
-				Value: new,
+				Value: nu,
 			},
 		}
 	}
 
-	for _, add := range new {
+	for _, add := range nu {
 		ops = append(ops, PatchOperation{
 			Op:    "add",
 			Path:  path + "/-",
@@ -374,18 +393,18 @@ func addContainers(existing, new []corev1.Container, path string) (ops []PatchOp
 	return ops
 }
 
-func addVolumes(existing, new []corev1.Volume, path string) (ops []PatchOperation) {
+func addVolumes(existing, nu []corev1.Volume, path string) (ops []PatchOperation) {
 	if len(existing) == 0 {
 		return []PatchOperation{
 			{
 				Op:    "add",
 				Path:  path,
-				Value: new,
+				Value: nu,
 			},
 		}
 	}
 
-	for _, add := range new {
+	for _, add := range nu {
 		ops = append(ops, PatchOperation{
 			Op:    "add",
 			Path:  path + "/-",
@@ -425,17 +444,17 @@ func addCertsVolumeMount(volumeName string, containers []corev1.Container, conta
 	return ops
 }
 
-func addAnnotations(existing, new map[string]string) (ops []PatchOperation) {
+func addAnnotations(existing, nu map[string]string) (ops []PatchOperation) {
 	if len(existing) == 0 {
 		return []PatchOperation{
 			{
 				Op:    "add",
 				Path:  "/metadata/annotations",
-				Value: new,
+				Value: nu,
 			},
 		}
 	}
-	for k, v := range new {
+	for k, v := range nu {
 		if existing[k] == "" {
 			ops = append(ops, PatchOperation{
 				Op:    "add",
@@ -455,11 +474,11 @@ func addAnnotations(existing, new map[string]string) (ops []PatchOperation) {
 
 // patch produces a list of patches to apply to a pod to inject a certificate. In particular,
 // we patch the pod in order to:
-//  - Mount the `certs` volume in existing containers and initContainers defined in the pod
-//  - Add the autocert-renewer as a container (a sidecar)
-//  - Add the autocert-bootstrapper as an initContainer
-//  - Add the `certs` volume definition
-//  - Annotate the pod to indicate that it's been processed by this controller
+// - Mount the `certs` volume in existing containers and initContainers defined in the pod
+// - Add the autocert-renewer as a container (a sidecar)
+// - Add the autocert-bootstrapper as an initContainer
+// - Add the `certs` volume definition
+// - Annotate the pod to indicate that it's been processed by this controller
 // The result is a list of serialized JSONPatch objects (or an error).
 func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Provisioner) ([]byte, error) {
 	var ops []PatchOperation
@@ -473,13 +492,15 @@ func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Pr
 	commonName := annotations[admissionWebhookAnnotationKey]
 	first := strings.EqualFold(annotations[firstAnnotationKey], "true")
 	sans := strings.Split(annotations[sansAnnotationKey], ",")
-	if len(annotations[sansAnnotationKey]) == 0 {
+	if annotations[sansAnnotationKey] == "" {
 		sans = []string{commonName}
 	}
 	bootstrapperOnly := strings.EqualFold(annotations[bootstrapperOnlyAnnotationKey], "true")
 	duration := annotations[durationWebhookStatusKey]
+	owner := annotations[ownerAnnotationKey]
+	mode := annotations[modeAnnotationKey]
 	renewer := mkRenewer(config, name, commonName, namespace)
-	bootstrapper, err := mkBootstrapper(config, name, commonName, duration, namespace, sans, provisioner)
+	bootstrapper, err := mkBootstrapper(config, name, commonName, duration, owner, mode, namespace, sans, provisioner)
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +533,7 @@ func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Pr
 // If the pod requests a certificate with a subject matching a namespace other than its own
 // and restrictToNamespace is true, then shouldMutate will return a validation error
 // that should be returned to the client.
-func shouldMutate(metadata *metav1.ObjectMeta, namespace string, clusterDomain string, restrictToNamespace bool) (bool, error) {
+func shouldMutate(metadata *metav1.ObjectMeta, namespace, clusterDomain string, restrictToNamespace bool) (bool, error) {
 	annotations := metadata.GetAnnotations()
 	if annotations == nil {
 		annotations = map[string]string{}
@@ -626,6 +647,11 @@ func main() {
 		panic(err)
 	}
 
+	// Initialize step environment
+	if err := step.Init(); err != nil {
+		panic(err)
+	}
+
 	log.SetOutput(os.Stdout)
 	if config.LogFormat == "json" {
 		log.SetFormatter(&log.JSONFormatter{})
@@ -645,7 +671,7 @@ func main() {
 		"provisionerKid":  provisionerKid,
 	}).Info("Loaded provisioner configuration")
 
-	password, err := utils.ReadPasswordFromFile(config.GetProvisionerPasswordPath())
+	password, err := readPasswordFromFile(config.GetProvisionerPasswordPath())
 	if err != nil {
 		panic(err)
 	}
@@ -681,7 +707,8 @@ func main() {
 	defer cancel()
 
 	srv, err := ca.BootstrapServer(ctx, token, &http.Server{
-		Addr: config.GetAddress(),
+		Addr:              config.GetAddress(),
+		ReadHeaderTimeout: 15 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/healthz" {
 				log.Info("/healthz")
@@ -698,7 +725,7 @@ func main() {
 
 			var body []byte
 			if r.Body != nil {
-				if data, err := ioutil.ReadAll(r.Body); err == nil {
+				if data, err := io.ReadAll(r.Body); err == nil {
 					body = data
 				}
 			}
@@ -763,4 +790,15 @@ func main() {
 	if err := srv.ListenAndServeTLS("", ""); err != nil {
 		panic(err)
 	}
+}
+
+// readPasswordFromFile reads and returns the password from the given filename.
+// The contents of the file will be trimmed at the right.
+func readPasswordFromFile(filename string) ([]byte, error) {
+	password, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, errs.FileError(err, filename)
+	}
+	password = bytes.TrimRightFunc(password, unicode.IsSpace)
+	return password, nil
 }
